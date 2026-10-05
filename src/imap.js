@@ -2,11 +2,21 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
 export class ImapClient {
-    constructor({ host, port, username, password, useStartTls = false, cancellable, logger }) {
+    constructor({
+        host,
+        port,
+        username,
+        password = null,
+        oauth2Token = null,
+        useStartTls = false,
+        cancellable,
+        logger,
+    }) {
         this._host = host;
         this._port = port;
         this._username = username;
         this._password = password;
+        this._oauth2Token = oauth2Token;
         this._useStartTls = useStartTls;
         this._cancellable = cancellable;
         this._logger = logger;
@@ -69,12 +79,73 @@ export class ImapClient {
     }
 
     async _login() {
+        if (this._oauth2Token) {
+            await this._authenticateXOAuth2();
+            return;
+        }
+
+        if (!this._password) {
+            throw new Error('IMAP password is missing');
+        }
+
         const user = this._quoteString(this._username);
         const pass = this._quoteString(this._password);
         const response = await this._sendCommand('LOGIN', `${user} ${pass}`);
         if (!response.includes('OK')) {
             throw new Error('IMAP login failed');
         }
+    }
+
+    async _authenticateXOAuth2() {
+        // SASL XOAUTH2 initial client response (RFC 7628 / Google IMAP)
+        const raw = `user=${this._username}\x01auth=Bearer ${this._oauth2Token}\x01\x01`;
+        const encoded = GLib.base64_encode(new TextEncoder().encode(raw));
+
+        this._commandId++;
+        const tag = `A${this._commandId.toString().padStart(4, '0')}`;
+        const cmd = `${tag} AUTHENTICATE XOAUTH2 ${encoded}\r\n`;
+        const bytes = new GLib.Bytes(new TextEncoder().encode(cmd));
+        await this._output.write_bytes_async(bytes, GLib.PRIORITY_DEFAULT, this._cancellable);
+
+        let response = await this._readUntil(new RegExp(`^\\+|${tag} (OK|NO|BAD)`, 'm'));
+
+        // On auth failure Gmail sends a "+" challenge; cancel with an empty line.
+        if (/^\+/m.test(response) && !new RegExp(`${tag} (OK|NO|BAD)`).test(response)) {
+            const empty = new GLib.Bytes(new TextEncoder().encode('\r\n'));
+            await this._output.write_bytes_async(
+                empty,
+                GLib.PRIORITY_DEFAULT,
+                this._cancellable,
+            );
+            response += await this._readUntil(new RegExp(`${tag} (OK|NO|BAD)`));
+        }
+
+        if (!response.includes(`${tag} OK`)) {
+            throw new Error('IMAP XOAUTH2 authentication failed');
+        }
+    }
+
+    async _readUntil(terminator) {
+        while (true) {
+            // eslint-disable-next-line no-await-in-loop -- sequential socket reads
+            const bytes = await this._input.read_bytes_async(
+                4096,
+                GLib.PRIORITY_DEFAULT,
+                this._cancellable,
+            );
+
+            if (bytes.get_size() === 0) break;
+
+            this._buffer += new TextDecoder('utf-8').decode(bytes.get_data());
+
+            if (terminator.test(this._buffer)) {
+                const result = this._buffer;
+                this._buffer = '';
+                return result;
+            }
+        }
+
+        return this._buffer;
     }
 
     async selectMailbox(mailbox = 'INBOX') {
@@ -98,6 +169,16 @@ export class ImapClient {
             .filter((id) => id);
     }
 
+    async searchGmMsgid(gmMsgid) {
+        const response = await this._sendCommand('UID SEARCH', `X-GM-MSGID ${gmMsgid}`);
+        const match = response.match(/\* SEARCH (.+)/);
+        if (!match || !match[1].trim()) {
+            return null;
+        }
+
+        return match[1].trim().split(/\s+/)[0];
+    }
+
     async fetchMessages(messageIds, limit = 10) {
         if (messageIds.length === 0) {
             return [];
@@ -111,6 +192,58 @@ export class ImapClient {
         );
 
         return this._parseMessages(response);
+    }
+
+    async deleteMessage(uid) {
+        const listResponse = await this._sendCommand('LIST', '"" "*"');
+        const trashFolder = this._findTrashFolder(listResponse);
+
+        if (trashFolder) {
+            const response = await this._sendCommand('UID MOVE', `${uid} "${trashFolder}"`);
+            if (response.includes('OK')) return;
+
+            // Some servers lack MOVE; copy then delete
+            const copyResponse = await this._sendCommand('UID COPY', `${uid} "${trashFolder}"`);
+            if (!copyResponse.includes('OK')) {
+                throw new Error('Failed to move message to trash');
+            }
+        }
+
+        const storeResponse = await this._sendCommand('UID STORE', `${uid} +FLAGS (\\Deleted)`);
+        if (!storeResponse.includes('OK')) {
+            throw new Error('Failed to mark message as deleted');
+        }
+
+        const expungeResponse = await this._sendCommand('UID EXPUNGE', String(uid));
+        if (!expungeResponse.includes('OK')) {
+            // UID EXPUNGE may be unsupported; fall back to EXPUNGE
+            const fallback = await this._sendCommand('EXPUNGE');
+            if (!fallback.includes('OK')) {
+                throw new Error('Failed to expunge deleted message');
+            }
+        }
+    }
+
+    _findTrashFolder(listResponse) {
+        const names = [];
+        for (const line of listResponse.split('\r\n')) {
+            const match = line.match(/^\* LIST \(.*\) (?:NIL|"[^"]*") (.+)$/);
+            if (!match) continue;
+
+            let name = match[1].trim();
+            if (name.startsWith('"') && name.endsWith('"')) {
+                name = name.slice(1, -1);
+            }
+            names.push(name);
+        }
+
+        const preferred = ['[Gmail]/Trash', '[Google Mail]/Trash', 'Trash', 'Deleted Items', 'INBOX.Trash', 'Deleted'];
+        for (const candidate of preferred) {
+            const found = names.find((n) => n.toLowerCase() === candidate.toLowerCase());
+            if (found) return found;
+        }
+
+        return names.find((n) => /trash|deleted/i.test(n)) || null;
     }
 
     async logout() {
@@ -219,6 +352,7 @@ export class ImapClient {
 
         return {
             id: messageIdMatch ? messageIdMatch[1] : `uid_${uid}`,
+            uid,
             subject: subjectMatch ? this._decodeMime(subjectMatch[1].trim()) : null,
             from: this._decodeMime(fromMatch ? fromMatch[1].trim() : '(Unknown sender)'),
             link: null,

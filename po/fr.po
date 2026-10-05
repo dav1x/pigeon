@@ -23,6 +23,15 @@ msgid "Unable to check emails: %s"
 msgstr "Impossible de vérifier les emails : %s"
 
 #: src/account.js
+msgid "Delete"
+msgstr ""
+
+#: src/account.js
+#, javascript-format
+msgid "Unable to delete email: %s"
+msgstr ""
+
+#: src/account.js
 #, javascript-format
 msgid "You have %d unread email"
 msgid_plural "You have %d unread emails"

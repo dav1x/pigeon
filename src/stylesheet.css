@@ -1,0 +1,8 @@
+/* Round trash control, matched to the notification close (X) button. */
+.pigeon-trash-button {
+    border-radius: 99px;
+}
+
+.pigeon-trash-button StIcon {
+    icon-size: 16px;
+}
