@@ -112,7 +112,47 @@ export class Account {
             this._openEmail(msg.link);
         });
 
+        if (msg.id && this._provider.deleteMessage) {
+            // Marker for the NotificationMessage._addAction patch, which turns
+            // this into a header trash icon beside the close button.
+            notification._pigeonOnDelete = () => {
+                this._deleteEmail(msg, notification);
+            };
+            // Keep the notification until delete finishes (addAction would
+            // otherwise destroy it when the callback returns).
+            notification.resident = true;
+            notification.addAction(_('Delete'), () => {
+                this._deleteEmail(msg, notification);
+            });
+        }
+
         source.addNotification(notification);
+    }
+
+    async _deleteEmail(msg, notification) {
+        try {
+            await this._provider.deleteMessage({
+                goaObject: this.goaAccount,
+                cancellable: this._cancellable,
+                httpSession: this._httpSession,
+                logger: this._logger,
+                mailbox: this.mailbox,
+                message: msg,
+            });
+
+            const ids = this._notifiedIds.get(this.mailbox) || [];
+            this._notifiedIds.set(
+                this.mailbox,
+                ids.filter((id) => id !== msg.id),
+            );
+
+            notification.destroy();
+        } catch (err) {
+            if (!err.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)) {
+                this._logger.log(`delete failed: ${err.message}`);
+                Main.notifyError(this.mailbox, _('Unable to delete email: %s').format(err.message));
+            }
+        }
     }
 
     _getSource() {
