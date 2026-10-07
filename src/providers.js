@@ -94,10 +94,9 @@ const googleProvider = {
 
         try {
             await client.connect();
-            await client.selectMailbox('INBOX');
-            const uid = await client.searchGmMsgid(gmMsgid);
-            if (!uid) throw new Error('Message not found in IMAP inbox');
-            await client.deleteMessage(uid);
+            const found = await client.findGmMsgid(gmMsgid);
+            if (!found) throw new Error('Message not found in IMAP mailbox');
+            await client.deleteMessage(found.uid);
         } finally {
             await client.logout();
         }

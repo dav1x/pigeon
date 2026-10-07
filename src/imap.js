@@ -9,6 +9,7 @@ export class ImapClient {
         password = null,
         oauth2Token = null,
         useStartTls = false,
+        timeoutSeconds = 30,
         cancellable,
         logger,
     }) {
@@ -20,6 +21,7 @@ export class ImapClient {
         this._useStartTls = useStartTls;
         this._cancellable = cancellable;
         this._logger = logger;
+        this._timeoutSeconds = timeoutSeconds;
         this._connection = null;
         this._input = null;
         this._output = null;
@@ -29,7 +31,8 @@ export class ImapClient {
 
     async connect() {
         const client = new Gio.SocketClient();
-        client.set_timeout(10);
+        // Gmail IMAP (esp. LIST / MOVE) routinely needs more than 10s.
+        client.set_timeout(this._timeoutSeconds);
 
         this._connection = await client.connect_to_host_async(
             `${this._host}:${this._port}`,
@@ -149,7 +152,7 @@ export class ImapClient {
     }
 
     async selectMailbox(mailbox = 'INBOX') {
-        const response = await this._sendCommand('SELECT', `"${mailbox}"`);
+        const response = await this._sendCommand('SELECT', this._quoteMailbox(mailbox));
         if (!response.includes('OK')) {
             throw new Error(`Failed to select mailbox: ${mailbox}`);
         }
@@ -179,6 +182,27 @@ export class ImapClient {
         return match[1].trim().split(/\s+/)[0];
     }
 
+    /**
+     * Find a Gmail message by X-GM-MSGID, trying INBOX then All Mail.
+     * Returns { uid, mailbox } or null.
+     */
+    async findGmMsgid(gmMsgid) {
+        const mailboxes = ['INBOX', '[Gmail]/All Mail', '[Google Mail]/All Mail'];
+        for (const mailbox of mailboxes) {
+            try {
+                // eslint-disable-next-line no-await-in-loop -- try mailboxes sequentially
+                await this.selectMailbox(mailbox);
+            } catch {
+                continue;
+            }
+
+            // eslint-disable-next-line no-await-in-loop -- try mailboxes sequentially
+            const uid = await this.searchGmMsgid(gmMsgid);
+            if (uid) return { uid, mailbox };
+        }
+        return null;
+    }
+
     async fetchMessages(messageIds, limit = 10) {
         if (messageIds.length === 0) {
             return [];
@@ -195,33 +219,90 @@ export class ImapClient {
     }
 
     async deleteMessage(uid) {
-        const listResponse = await this._sendCommand('LIST', '"" "*"');
-        const trashFolder = this._findTrashFolder(listResponse);
+        // Fast path for Gmail: add \Trash label (avoids LIST of every folder).
+        if (this._oauth2Token) {
+            const labelResponse = await this._sendCommand(
+                'UID STORE',
+                `${uid} +X-GM-LABELS (\\Trash)`,
+            );
+            if (labelResponse.includes('OK')) return;
 
-        if (trashFolder) {
-            const response = await this._sendCommand('UID MOVE', `${uid} "${trashFolder}"`);
-            if (response.includes('OK')) return;
+            // Fall back to moving into Gmail's trash mailbox only.
+            for (const trashFolder of ['[Gmail]/Trash', '[Google Mail]/Trash']) {
+                // eslint-disable-next-line no-await-in-loop -- try known Gmail trash names
+                const moveResponse = await this._sendCommand(
+                    'UID MOVE',
+                    `${uid} ${this._quoteMailbox(trashFolder)}`,
+                );
+                if (moveResponse.includes('OK')) return;
+            }
 
-            // Some servers lack MOVE; copy then delete
-            const copyResponse = await this._sendCommand('UID COPY', `${uid} "${trashFolder}"`);
-            if (!copyResponse.includes('OK')) {
-                throw new Error('Failed to move message to trash');
+            await this._expungeUid(uid);
+            return;
+        }
+
+        // Generic IMAP: try common trash mailboxes, then a narrow LIST.
+        for (const trashFolder of this._candidateTrashFolders()) {
+            // eslint-disable-next-line no-await-in-loop -- try candidates sequentially
+            const moveResponse = await this._sendCommand(
+                'UID MOVE',
+                `${uid} ${this._quoteMailbox(trashFolder)}`,
+            );
+            if (moveResponse.includes('OK')) return;
+
+            // eslint-disable-next-line no-await-in-loop -- try candidates sequentially
+            const copyResponse = await this._sendCommand(
+                'UID COPY',
+                `${uid} ${this._quoteMailbox(trashFolder)}`,
+            );
+            if (copyResponse.includes('OK')) {
+                await this._expungeUid(uid);
+                return;
             }
         }
 
+        const listResponse = await this._sendCommand('LIST', '"" "*Trash*"');
+        const trashFolder = this._findTrashFolder(listResponse);
+        if (trashFolder) {
+            const moveResponse = await this._sendCommand(
+                'UID MOVE',
+                `${uid} ${this._quoteMailbox(trashFolder)}`,
+            );
+            if (moveResponse.includes('OK')) return;
+        }
+
+        await this._expungeUid(uid);
+    }
+
+    async _expungeUid(uid) {
         const storeResponse = await this._sendCommand('UID STORE', `${uid} +FLAGS (\\Deleted)`);
         if (!storeResponse.includes('OK')) {
             throw new Error('Failed to mark message as deleted');
         }
 
         const expungeResponse = await this._sendCommand('UID EXPUNGE', String(uid));
-        if (!expungeResponse.includes('OK')) {
-            // UID EXPUNGE may be unsupported; fall back to EXPUNGE
-            const fallback = await this._sendCommand('EXPUNGE');
-            if (!fallback.includes('OK')) {
-                throw new Error('Failed to expunge deleted message');
-            }
+        if (expungeResponse.includes('OK')) return;
+
+        const fallback = await this._sendCommand('EXPUNGE');
+        if (!fallback.includes('OK')) {
+            throw new Error('Failed to expunge deleted message');
         }
+    }
+
+    _quoteMailbox(name) {
+        if (name.startsWith('"')) return name;
+        return `"${name.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+
+    _candidateTrashFolders() {
+        return [
+            '[Gmail]/Trash',
+            '[Google Mail]/Trash',
+            'Trash',
+            'Deleted Items',
+            'INBOX.Trash',
+            'Deleted',
+        ];
     }
 
     _findTrashFolder(listResponse) {
@@ -237,8 +318,7 @@ export class ImapClient {
             names.push(name);
         }
 
-        const preferred = ['[Gmail]/Trash', '[Google Mail]/Trash', 'Trash', 'Deleted Items', 'INBOX.Trash', 'Deleted'];
-        for (const candidate of preferred) {
+        for (const candidate of this._candidateTrashFolders()) {
             const found = names.find((n) => n.toLowerCase() === candidate.toLowerCase());
             if (found) return found;
         }
